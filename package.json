@@ -1,6 +1,6 @@
 {
   "name": "steadykey",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Deterministic idempotency key manager for JSON payloads with multi-backend storage.",
   "type": "module",
   "exports": {
