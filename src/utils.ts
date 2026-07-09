@@ -2,10 +2,16 @@ import { createHash } from "crypto";
 import { IdempotencySerializationError, IdempotencyError } from "./errors.js";
 import type { HashAlgorithm, IdempotencyRecord } from "./types.js";
 
+const STRING_PREFIX = "str:";
 const BIGINT_PREFIX = "bigint:";
 const BUFFER_PREFIX = "buffer:";
+const DATE_PREFIX = "date:";
 const MAP_PREFIX = "map:";
 const SET_PREFIX = "set:";
+
+const compareCodeUnits = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+const MAX_DEPTH = 256;
 
 export type CanonicalJsonValue =
   | string
@@ -21,7 +27,7 @@ export interface SerializeRecordInput {
 
 export const canonicalize = (value: unknown): string => {
   try {
-    const normalized = normalize(value);
+    const normalized = normalize(value, 0);
     return JSON.stringify(normalized);
   } catch (error) {
     throw new IdempotencySerializationError(
@@ -30,9 +36,28 @@ export const canonicalize = (value: unknown): string => {
   }
 };
 
-const normalize = (value: unknown): CanonicalJsonValue => {
-  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return value as CanonicalJsonValue;
+const normalize = (value: unknown, depth: number): CanonicalJsonValue => {
+  if (depth > MAX_DEPTH) {
+    throw new IdempotencySerializationError(`Payload nesting exceeds the maximum depth of ${MAX_DEPTH}`);
+  }
+
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new IdempotencySerializationError(`Non-finite number cannot be canonicalized: ${value}`);
+    }
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return `${STRING_PREFIX}${value}`;
   }
 
   if (typeof value === "bigint") {
@@ -40,7 +65,7 @@ const normalize = (value: unknown): CanonicalJsonValue => {
   }
 
   if (value instanceof Date) {
-    return value.toJSON();
+    return `${DATE_PREFIX}${value.toISOString()}`;
   }
 
   if (Buffer.isBuffer(value)) {
@@ -48,32 +73,31 @@ const normalize = (value: unknown): CanonicalJsonValue => {
   }
 
   if (Array.isArray(value)) {
-    return value.map((item) => normalize(item));
+    return value.map((item) => normalize(item, depth + 1));
   }
 
   if (value instanceof Map) {
-    return Array.from(value.entries())
-      .map(([entryKey, entryValue]) => [String(entryKey), normalize(entryValue)] as const)
-      .sort(([keyA], [keyB]) => keyA.localeCompare(keyB))
-      .map(([entryKey, entryValue]) => `${MAP_PREFIX}${entryKey}:${JSON.stringify(entryValue)}`);
+    const entries = Array.from(value.entries())
+      .map(([entryKey, entryValue]) => [String(entryKey), normalize(entryValue, depth + 1)] as const)
+      .sort(([keyA], [keyB]) => compareCodeUnits(keyA, keyB));
+    return `${MAP_PREFIX}${JSON.stringify(entries)}`;
   }
 
   if (value instanceof Set) {
-    const normalizedValues = Array.from(value.values()).map((entry) => normalize(entry));
-    return normalizedValues
-      .map((entry) => JSON.stringify(entry))
-      .sort()
-      .map((entry) => `${SET_PREFIX}${entry}`);
+    const entries = Array.from(value.values())
+      .map((entry) => JSON.stringify(normalize(entry, depth + 1)))
+      .sort(compareCodeUnits);
+    return `${SET_PREFIX}${JSON.stringify(entries)}`;
   }
 
   if (typeof value === "object") {
-    const plain: Record<string, CanonicalJsonValue> = {};
+    const plain = Object.create(null) as Record<string, CanonicalJsonValue>;
     const entries = Object.entries(value as Record<string, unknown>)
       .filter(([, entryValue]) => entryValue !== undefined)
-      .sort(([keyA], [keyB]) => keyA.localeCompare(keyB));
+      .sort(([keyA], [keyB]) => compareCodeUnits(keyA, keyB));
 
     for (const [entryKey, entryValue] of entries) {
-      plain[entryKey] = normalize(entryValue);
+      plain[entryKey] = normalize(entryValue, depth + 1);
     }
 
     return plain;

@@ -6,25 +6,78 @@ export type JsonValue = JsonPrimitive | { [key: string]: JsonValue } | JsonValue
 
 export type IdempotencyMetadata = JsonValue;
 
-export interface IdempotencyManagerOptions {
-  readonly keyPrefix?: string;
-  readonly defaultTtlSeconds?: number | null;
-  readonly hashAlgorithm?: HashAlgorithm;
-  readonly storeCanonicalPayload?: boolean;
+export type IdempotencyStatus = "pending" | "completed" | "failed";
+
+export type HashFunction = (canonicalValue: string) => string;
+
+export type InFlightMode = "wait" | "fail-fast";
+
+export type FailureMode = "retry" | "cache";
+
+export interface KeyDerivationOptions {
+  readonly namespace?: string;
+  readonly idempotencyKey?: string;
+  readonly ignoreFields?: readonly string[];
+  readonly pickFields?: readonly string[];
 }
 
-export interface IdempotencyRegisterOptions {
+export interface IdempotencyEventContext {
+  readonly id: string;
+  readonly key: string;
+  readonly namespace?: string;
+}
+
+export interface IdempotencyEvents {
+  readonly onHit?: (context: IdempotencyEventContext & { record: IdempotencyRecord }) => void;
+  readonly onMiss?: (context: IdempotencyEventContext) => void;
+  readonly onStore?: (context: IdempotencyEventContext & { record: IdempotencyRecord }) => void;
+  readonly onCollision?: (context: IdempotencyEventContext) => void;
+  readonly onComplete?: (context: IdempotencyEventContext & { record: IdempotencyRecord }) => void;
+  readonly onFail?: (context: IdempotencyEventContext & { record: IdempotencyRecord }) => void;
+}
+
+export interface IdempotencyManagerOptions {
+  readonly keyPrefix?: string;
+  readonly namespace?: string;
+  readonly defaultTtlSeconds?: number | null;
+  readonly hashAlgorithm?: HashAlgorithm;
+  readonly hashFn?: HashFunction;
+  readonly storeCanonicalPayload?: boolean;
+  readonly slidingTtl?: boolean;
+  readonly events?: IdempotencyEvents;
+}
+
+export interface IdempotencyRegisterOptions extends KeyDerivationOptions {
   readonly ttlSeconds?: number | null;
   readonly metadata?: IdempotencyMetadata;
   readonly storeCanonicalPayload?: boolean;
+  readonly status?: IdempotencyStatus;
+  readonly result?: JsonValue;
+}
+
+export interface IdempotencyExecuteOptions extends KeyDerivationOptions {
+  readonly ttlSeconds?: number | null;
+  readonly metadata?: IdempotencyMetadata;
+  readonly storeCanonicalPayload?: boolean;
+  readonly storeResult?: boolean;
+  readonly leaseSeconds?: number;
+  readonly inFlight?: InFlightMode;
+  readonly waitTimeoutMs?: number;
+  readonly pollIntervalMs?: number;
+  readonly failureMode?: FailureMode;
 }
 
 export interface IdempotencyRecord {
   readonly id: string;
   readonly payloadHash: string;
   readonly createdAt: string;
+  readonly status?: IdempotencyStatus;
   readonly metadata?: IdempotencyMetadata;
   readonly canonicalPayload?: string;
+  readonly result?: JsonValue;
+  readonly error?: JsonValue;
+  readonly attemptId?: string;
+  readonly updatedAt?: string;
   readonly ttlSeconds?: number | null;
 }
 
@@ -40,6 +93,35 @@ export interface IdempotencyLookupResult {
   readonly key: string;
   readonly record: IdempotencyRecord;
   readonly ttlSeconds?: number | null;
+}
+
+export interface IdempotencyExecuteResult<T> {
+  readonly id: string;
+  readonly key: string;
+  readonly fromCache: boolean;
+  readonly status: IdempotencyStatus;
+  readonly value: T;
+  readonly record: IdempotencyRecord;
+}
+
+export interface IdempotencyLookupOptions {
+  readonly namespace?: string;
+  readonly slidingTtl?: boolean;
+}
+
+export interface IdempotencyMutateOptions {
+  readonly namespace?: string;
+}
+
+export interface IdempotencyTransitionOptions {
+  readonly namespace?: string;
+  readonly ttlSeconds?: number | null;
+}
+
+export interface IdempotencyTransitionResult {
+  readonly id: string;
+  readonly key: string;
+  readonly record: IdempotencyRecord;
 }
 
 export interface IdempotencyStoreValue {
@@ -77,7 +159,12 @@ export interface MongoCollectionLike<TDocument> {
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
     options?: { upsert?: boolean },
-  ): Promise<{ matchedCount: number; modifiedCount: number }>;
+  ): Promise<{
+    matchedCount: number;
+    modifiedCount: number;
+    upsertedCount?: number;
+    upsertedId?: unknown;
+  }>;
   deleteOne(filter: Record<string, unknown>): Promise<{ deletedCount?: number }>;
   createIndex(keys: Record<string, unknown>, options?: Record<string, unknown>): Promise<string>;
 }

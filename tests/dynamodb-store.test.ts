@@ -21,8 +21,19 @@ class FakeDynamoDbClient implements DynamoDbClientLike {
       throw new Error("partition key must be a string");
     }
 
-    if (params.ConditionExpression?.includes("attribute_not_exists")) {
-      if (this.items.has(keyValue)) {
+    const condition = params.ConditionExpression;
+    if (condition?.includes("attribute_not_exists")) {
+      const existing = this.items.get(keyValue);
+      const allowsExpiredOverwrite = condition.includes("<= :now");
+      const now = params.ExpressionAttributeValues?.[":now"];
+      const ttlName = params.ExpressionAttributeNames?.["#ttl"] ?? "expiresAt";
+      const existingTtl = existing?.[ttlName];
+      const expired =
+        allowsExpiredOverwrite &&
+        typeof existingTtl === "number" &&
+        typeof now === "number" &&
+        existingTtl <= now;
+      if (existing && !expired) {
         const error = new Error(CONDITIONAL_CHECK_FAILED);
         error.name = CONDITIONAL_CHECK_FAILED;
         throw error;
@@ -118,7 +129,23 @@ class FakeDynamoDbClient implements DynamoDbClientLike {
 
     const existing = this.items.get(keyValue);
     if (!existing) {
+      if (params.ConditionExpression) {
+        const error = new Error(CONDITIONAL_CHECK_FAILED);
+        error.name = CONDITIONAL_CHECK_FAILED;
+        throw error;
+      }
       return {};
+    }
+    if (params.ConditionExpression?.includes("<= :now")) {
+      const now = params.ExpressionAttributeValues?.[":now"];
+      const ttlName = params.ExpressionAttributeNames?.["#ttl"] ?? "expiresAt";
+      const existingTtl = existing[ttlName];
+      const stillExpired = typeof existingTtl === "number" && typeof now === "number" && existingTtl <= now;
+      if (!stillExpired) {
+        const error = new Error(CONDITIONAL_CHECK_FAILED);
+        error.name = CONDITIONAL_CHECK_FAILED;
+        throw error;
+      }
     }
 
     this.items.delete(keyValue);
@@ -189,5 +216,33 @@ describe("DynamoDbIdempotencyStore", () => {
     await store.setIfAbsent("id", "value", null);
     const deleted = await store.delete("id");
     expect(deleted).toBe(true);
+  });
+
+  it("overwrites an expired item on setIfAbsent (DynamoDB TTL sweeper lag)", async () => {
+    const first = await store.setIfAbsent("id", "old", 60);
+    expect(first).toBe(true);
+    expect(await store.setIfAbsent("id", "new", 60)).toBe(false);
+    vi.advanceTimersByTime(61_000);
+    const overwrite = await store.setIfAbsent("id", "new", 60);
+    expect(overwrite).toBe(true);
+
+    const got = await store.get("id");
+    expect(got?.value).toBe("new");
+  });
+
+  it("does not overwrite a persistent (no-TTL) item on setIfAbsent", async () => {
+    expect(await store.setIfAbsent("id", "persistent", null)).toBe(true);
+    vi.advanceTimersByTime(10 * 365 * 24 * 3600 * 1000);
+    expect(await store.setIfAbsent("id", "other", 60)).toBe(false);
+    const got = await store.get("id");
+    expect(got?.value).toBe("persistent");
+  });
+
+  it("lazily deletes an expired item on read", async () => {
+    await store.setIfAbsent("id", "value", 60);
+    vi.advanceTimersByTime(61_000);
+    expect(await store.get("id")).toBeNull();
+    const raw = await client.get({ TableName: "steadykey", Key: { key: "id" } });
+    expect(raw?.Item).toBeUndefined();
   });
 });

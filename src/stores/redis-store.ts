@@ -1,11 +1,19 @@
-import type { RedisClientType, SetOptions } from "redis";
 import { IdempotencyError } from "../errors.js";
 import type { IdempotencyStore, IdempotencyStoreValue } from "../types.js";
 
-export type RedisClientLike = Pick<
-  RedisClientType,
-  "set" | "get" | "ttl" | "persist" | "del"
->;
+export interface RedisSetOptions {
+  NX?: boolean;
+  XX?: boolean;
+  EX?: number;
+}
+
+export interface RedisClientLike {
+  set(key: string, value: string, options?: RedisSetOptions): Promise<string | null>;
+  get(key: string): Promise<string | null>;
+  ttl(key: string): Promise<number>;
+  persist(key: string): Promise<boolean | number>;
+  del(key: string): Promise<number>;
+}
 
 const toTtlSeconds = (ttl: number): number | null => {
   if (ttl < 0) {
@@ -22,7 +30,7 @@ export class RedisIdempotencyStore implements IdempotencyStore {
   }
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
-    const options: SetOptions = { NX: true };
+    const options: RedisSetOptions = { NX: true };
     if (typeof ttlSeconds === "number" && ttlSeconds > 0) {
       options.EX = ttlSeconds;
     }
@@ -40,7 +48,7 @@ export class RedisIdempotencyStore implements IdempotencyStore {
   }
 
   async update(key: string, value: string, ttlSeconds: number | null): Promise<void> {
-    const options: SetOptions = { XX: true };
+    const options: RedisSetOptions = { XX: true };
     if (typeof ttlSeconds === "number" && ttlSeconds > 0) {
       options.EX = ttlSeconds;
     }

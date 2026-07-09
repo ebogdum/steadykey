@@ -1,4 +1,6 @@
 import { IdempotencyError } from "../errors.js";
+import { quoteIdentifier, indexBaseName } from "../internal/sql.js";
+import { futureDate, remainingSeconds } from "../internal/time.js";
 import type { IdempotencyStore, IdempotencyStoreValue, PgClientLike } from "../types.js";
 
 interface PostgresStoreOptions {
@@ -13,31 +15,6 @@ interface PostgresRow {
 
 const DEFAULT_TABLE = "steadykey_entries";
 
-const quoteIdentifier = (identifier: string): string => {
-  if (!/^[A-Za-z_][A-Za-z0-9_$.]*$/.test(identifier)) {
-    throw new IdempotencyError(`Invalid identifier provided: ${identifier}`);
-  }
-  return identifier
-    .split(".")
-    .map((segment) => `"${segment.replace(/"/g, '""')}"`)
-    .join(".");
-};
-
-const toDateOrNull = (ttlSeconds: number | null): Date | null => {
-  if (typeof ttlSeconds === "number" && ttlSeconds > 0) {
-    return new Date(Date.now() + ttlSeconds * 1000);
-  }
-  return null;
-};
-
-const ttlFromDate = (expiresAt: Date | null): number | null => {
-  if (!expiresAt) {
-    return null;
-  }
-  const remaining = Math.floor((expiresAt.getTime() - Date.now()) / 1000);
-  return remaining > 0 ? remaining : 0;
-};
-
 const CURRENT_CONDITION = "(expires_at IS NULL OR expires_at > NOW())";
 
 export class PostgresIdempotencyStore implements IdempotencyStore {
@@ -50,9 +27,9 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
       throw new IdempotencyError("PostgreSQL client instance is required for PostgresIdempotencyStore");
     }
 
-  const rawTable = options.tableName ?? DEFAULT_TABLE;
-  this.table = quoteIdentifier(rawTable);
-  this.indexName = `${rawTable.replace(/"/g, "").replace(/\./g, "_")}_expires_at_idx`;
+    const rawTable = options.tableName ?? DEFAULT_TABLE;
+    this.table = quoteIdentifier(rawTable, '"');
+    this.indexName = `${indexBaseName(rawTable)}_expires_at_idx`;
 
     if (options.ensureTable === false) {
       this.ready = Promise.resolve();
@@ -75,11 +52,15 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
     await this.ready;
-    const expiresAt = toDateOrNull(ttlSeconds);
+    const expiresAt = futureDate(ttlSeconds);
     const result = await this.client.query(
       `INSERT INTO ${this.table} (key, value, expires_at)
        VALUES ($1, $2, $3)
-       ON CONFLICT (key) DO NOTHING`,
+       ON CONFLICT (key) DO UPDATE SET
+         value = EXCLUDED.value,
+         expires_at = EXCLUDED.expires_at
+       WHERE ${this.table}.expires_at IS NOT NULL
+         AND ${this.table}.expires_at <= NOW()`,
       [key, value, expiresAt],
     );
     return result.rowCount === 1;
@@ -96,12 +77,12 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
       return null;
     }
     const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
-    return { value: row.value, ttlSeconds: ttlFromDate(expiresAt) };
+    return { value: row.value, ttlSeconds: remainingSeconds(expiresAt) };
   }
 
   async update(key: string, value: string, ttlSeconds: number | null): Promise<void> {
     await this.ready;
-    const expiresAt = toDateOrNull(ttlSeconds);
+    const expiresAt = futureDate(ttlSeconds);
     const result = await this.client.query(
       `UPDATE ${this.table}
          SET value = $2,

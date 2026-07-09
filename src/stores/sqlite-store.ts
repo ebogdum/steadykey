@@ -1,4 +1,6 @@
 import { IdempotencyError } from "../errors.js";
+import { quoteIdentifier, indexBaseName } from "../internal/sql.js";
+import { futureEpochSeconds, remainingFromEpoch, maybeAwait } from "../internal/time.js";
 import type { IdempotencyStore, IdempotencyStoreValue, SqliteDatabaseLike, SqliteRunResult } from "../types.js";
 
 interface SqliteStoreOptions {
@@ -13,38 +15,9 @@ interface SqliteRow {
 
 const DEFAULT_TABLE = "steadykey_entries";
 
-const isPromise = <T>(value: T | Promise<T>): value is Promise<T> =>
-  typeof value === "object" && value !== null && "then" in (value as unknown as Record<string, unknown>);
-
-const maybeAwait = async <T>(value: T | Promise<T>): Promise<T> => (isPromise(value) ? value : Promise.resolve(value));
-
-const quoteIdentifier = (identifier: string): string => {
-  if (!/^[A-Za-z_][A-Za-z0-9_$.]*$/.test(identifier)) {
-    throw new IdempotencyError(`Invalid identifier provided: ${identifier}`);
-  }
-  return identifier
-    .split(".")
-    .map((segment) => `"${segment.replace(/"/g, '""')}"`)
-    .join(".");
-};
-
-const expirationEpoch = (ttlSeconds: number | null): number | null => {
-  if (typeof ttlSeconds === "number" && ttlSeconds > 0) {
-    return Math.floor((Date.now() + ttlSeconds * 1000) / 1000);
-  }
-  return null;
-};
-
-const ttlFromEpoch = (epochSeconds: number | null): number | null => {
-  if (epochSeconds === null) {
-    return null;
-  }
-  const remaining = epochSeconds - Math.floor(Date.now() / 1000);
-  return remaining > 0 ? remaining : 0;
-};
-
 export class SqliteIdempotencyStore implements IdempotencyStore {
   private readonly table: string;
+  private readonly indexName: string;
   private readonly ready: Promise<void>;
 
   constructor(private readonly db: SqliteDatabaseLike, options: SqliteStoreOptions = {}) {
@@ -53,7 +26,8 @@ export class SqliteIdempotencyStore implements IdempotencyStore {
     }
 
     const rawTable = options.tableName ?? DEFAULT_TABLE;
-    this.table = quoteIdentifier(rawTable);
+    this.table = quoteIdentifier(rawTable, '"');
+    this.indexName = `${indexBaseName(rawTable)}_expires_at_idx`;
 
     if (options.ensureTable === false) {
       this.ready = Promise.resolve();
@@ -69,7 +43,7 @@ export class SqliteIdempotencyStore implements IdempotencyStore {
         value TEXT NOT NULL,
         expires_at INTEGER NULL
       );
-      CREATE INDEX IF NOT EXISTS ${this.table.replace(/"/g, "").replace(/\./g, "_")}_expires_at_idx
+      CREATE INDEX IF NOT EXISTS ${this.indexName}
         ON ${this.table} (expires_at);
     `;
     await maybeAwait(this.db.exec(ddl));
@@ -77,12 +51,16 @@ export class SqliteIdempotencyStore implements IdempotencyStore {
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
     await this.ready;
-    const expiresAt = expirationEpoch(ttlSeconds);
+    const expiresAt = futureEpochSeconds(ttlSeconds);
     const result = await maybeAwait<SqliteRunResult>(
       this.db.run(
         `INSERT INTO ${this.table} (key, value, expires_at)
          VALUES (?, ?, ?)
-         ON CONFLICT (key) DO NOTHING`,
+         ON CONFLICT (key) DO UPDATE SET
+           value = excluded.value,
+           expires_at = excluded.expires_at
+         WHERE expires_at IS NOT NULL
+           AND expires_at <= CAST(STRFTIME('%s', 'now') AS INTEGER)`,
         [key, value, expiresAt],
       ),
     );
@@ -107,13 +85,13 @@ export class SqliteIdempotencyStore implements IdempotencyStore {
 
     return {
       value: row.value,
-      ttlSeconds: ttlFromEpoch(row.expires_at ?? null),
+      ttlSeconds: remainingFromEpoch(row.expires_at ?? null),
     };
   }
 
   async update(key: string, value: string, ttlSeconds: number | null): Promise<void> {
     await this.ready;
-    const expiresAt = expirationEpoch(ttlSeconds);
+    const expiresAt = futureEpochSeconds(ttlSeconds);
     const result = await maybeAwait<SqliteRunResult>(
       this.db.run(
         `UPDATE ${this.table}

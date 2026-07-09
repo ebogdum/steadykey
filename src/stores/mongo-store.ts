@@ -46,10 +46,16 @@ export class MongoIdempotencyStore implements IdempotencyStore {
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
     await this.ready;
-    const expiresAt = typeof ttlSeconds === "number" && ttlSeconds > 0 ? new Date(Date.now() + ttlSeconds * 1000) : null;
+    const now = new Date();
+    const expiresAt = typeof ttlSeconds === "number" && ttlSeconds > 0 ? new Date(now.getTime() + ttlSeconds * 1000) : null;
     try {
-      await this.collection.insertOne({ _id: key, value, expiresAt: expiresAt ?? undefined });
-      return true;
+      const result = await this.collection.updateOne(
+        { _id: key, expiresAt: { $lte: now } },
+        { $set: { value, expiresAt: expiresAt ?? null } },
+        { upsert: true },
+      );
+      const upserted = (result.upsertedCount ?? (result.upsertedId ? 1 : 0)) > 0;
+      return upserted || result.modifiedCount > 0;
     } catch (error) {
       if (isDuplicateKeyError(error)) {
         return false;
@@ -66,7 +72,7 @@ export class MongoIdempotencyStore implements IdempotencyStore {
     }
 
     if (document.expiresAt && document.expiresAt.getTime() <= Date.now()) {
-      await this.delete(key);
+      await this.collection.deleteOne({ _id: key, expiresAt: { $lte: new Date() } });
       return null;
     }
 

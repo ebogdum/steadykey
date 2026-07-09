@@ -18,3 +18,15 @@ export class IdempotencySerializationError extends IdempotencyError {
     this.name = "IdempotencySerializationError";
   }
 }
+
+export class IdempotencyInProgressError extends IdempotencyError {
+  public readonly id: string;
+  public readonly key: string;
+
+  constructor(id: string, key: string, message?: string) {
+    super(message ?? `Operation for key ${key} is already in progress`);
+    this.name = "IdempotencyInProgressError";
+    this.id = id;
+    this.key = key;
+  }
+}

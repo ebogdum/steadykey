@@ -1,4 +1,6 @@
 import { IdempotencyError } from "../errors.js";
+import { quoteIdentifier } from "../internal/sql.js";
+import { futureDate, remainingSeconds } from "../internal/time.js";
 import type { IdempotencyStore, IdempotencyStoreValue, MySqlClientLike } from "../types.js";
 
 interface MySqlStoreOptions {
@@ -19,31 +21,14 @@ interface MySqlResult {
 const DEFAULT_TABLE = "steadykey_entries";
 const DEFAULT_KEY_LENGTH = 128;
 
-const quoteIdentifier = (identifier: string): string => {
-  if (!/^[A-Za-z_][A-Za-z0-9_$.]*$/.test(identifier)) {
-    throw new IdempotencyError(`Invalid identifier provided: ${identifier}`);
+const resolveKeyLength = (keyLength: number | undefined): number => {
+  if (keyLength === undefined) {
+    return DEFAULT_KEY_LENGTH;
   }
-  return identifier
-    .split(".")
-    .map((segment) => `
-      \`${segment.replace(/`/g, "``")}\`
-    `.trim())
-    .join(".");
-};
-
-const toDateOrNull = (ttlSeconds: number | null): Date | null => {
-  if (typeof ttlSeconds === "number" && ttlSeconds > 0) {
-    return new Date(Date.now() + ttlSeconds * 1000);
+  if (!Number.isInteger(keyLength) || keyLength < 1 || keyLength > 65535) {
+    throw new IdempotencyError("keyLength must be an integer between 1 and 65535");
   }
-  return null;
-};
-
-const ttlFromDate = (expires: Date | null): number | null => {
-  if (!expires) {
-    return null;
-  }
-  const diff = Math.floor((expires.getTime() - Date.now()) / 1000);
-  return diff > 0 ? diff : 0;
+  return keyLength;
 };
 
 const toDate = (value: Date | string | null | undefined): Date | null => {
@@ -56,7 +41,8 @@ const toDate = (value: Date | string | null | undefined): Date | null => {
   return new Date(value);
 };
 
-const CURRENT_CONDITION = "(`expires_at` IS NULL OR `expires_at` > UTC_TIMESTAMP())";
+const CURRENT_CONDITION = "(`expires_at` IS NULL OR `expires_at` > ?)";
+const EXPIRED_PREDICATE = "`expires_at` IS NOT NULL AND `expires_at` <= ?";
 
 export class MySqlIdempotencyStore implements IdempotencyStore {
   private readonly table: string;
@@ -67,9 +53,9 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
     if (!client) {
       throw new IdempotencyError("MySQL client instance is required for MySqlIdempotencyStore");
     }
-    this.keyLength = options.keyLength ?? DEFAULT_KEY_LENGTH;
+    this.keyLength = resolveKeyLength(options.keyLength);
     const rawTable = options.tableName ?? DEFAULT_TABLE;
-    this.table = quoteIdentifier(rawTable);
+    this.table = quoteIdentifier(rawTable, "`");
     if (options.ensureTable === false) {
       this.ready = Promise.resolve();
     } else {
@@ -91,20 +77,24 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
     await this.ready;
-    const expiresAt = toDateOrNull(ttlSeconds);
+    const expiresAt = futureDate(ttlSeconds);
+    await this.client.execute<MySqlResult>(
+      `DELETE FROM ${this.table} WHERE \`key\` = ? AND ${EXPIRED_PREDICATE}`,
+      [key, new Date()],
+    );
     const [result] = await this.client.execute<MySqlResult>(
       `INSERT IGNORE INTO ${this.table} (\`key\`, \`value\`, \`expires_at\`)
        VALUES (?, ?, ?)`,
       [key, value, expiresAt],
     );
-    return Boolean((result as MySqlResult).affectedRows === 1);
+    return (result as MySqlResult).affectedRows === 1;
   }
 
   async get(key: string): Promise<IdempotencyStoreValue | null> {
     await this.ready;
     const [rows] = await this.client.execute<MySqlRow[]>(
       `SELECT \`value\`, \`expires_at\` FROM ${this.table} WHERE \`key\` = ? AND ${CURRENT_CONDITION} LIMIT 1`,
-      [key],
+      [key, new Date()],
     );
 
     const row = Array.isArray(rows) ? rows[0] : undefined;
@@ -114,13 +104,13 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
 
     return {
       value: row.value,
-      ttlSeconds: ttlFromDate(toDate(row.expires_at)),
+      ttlSeconds: remainingSeconds(toDate(row.expires_at)),
     };
   }
 
   async update(key: string, value: string, ttlSeconds: number | null): Promise<void> {
     await this.ready;
-    const expiresAt = toDateOrNull(ttlSeconds);
+    const expiresAt = futureDate(ttlSeconds);
     const [result] = await this.client.execute<MySqlResult>(
       `UPDATE ${this.table}
          SET \`value\` = ?,

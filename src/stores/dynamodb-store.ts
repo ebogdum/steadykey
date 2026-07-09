@@ -67,7 +67,7 @@ export class DynamoDbIdempotencyStore implements IdempotencyStore {
     this.partitionKey = options.partitionKey ?? DEFAULT_PARTITION_KEY;
     this.valueAttribute = options.valueAttribute ?? DEFAULT_VALUE_ATTRIBUTE;
     this.ttlAttribute = options.ttlAttribute ?? DEFAULT_TTL_ATTRIBUTE;
-    this.consistentRead = options.consistentRead ?? false;
+    this.consistentRead = options.consistentRead ?? true;
   }
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
@@ -80,13 +80,18 @@ export class DynamoDbIdempotencyStore implements IdempotencyStore {
       item[this.ttlAttribute] = ttlEpoch;
     }
 
+    const nowEpoch = Math.floor(Date.now() / 1000);
     try {
       await this.client.put({
         TableName: this.tableName,
         Item: item,
-        ConditionExpression: "attribute_not_exists(#pk)",
+        ConditionExpression: "attribute_not_exists(#pk) OR #ttl <= :now",
         ExpressionAttributeNames: {
           "#pk": this.partitionKey,
+          "#ttl": this.ttlAttribute,
+        },
+        ExpressionAttributeValues: {
+          ":now": nowEpoch,
         },
       });
       return true;
@@ -130,9 +135,16 @@ export class DynamoDbIdempotencyStore implements IdempotencyStore {
           Key: {
             [this.partitionKey]: key,
           },
+          ConditionExpression: "#ttl <= :now",
+          ExpressionAttributeNames: {
+            "#ttl": this.ttlAttribute,
+          },
+          ExpressionAttributeValues: {
+            ":now": Math.floor(Date.now() / 1000),
+          },
         });
       } catch {
-        // Best-effort clean up; ignore failures because the record is already expired logically.
+        return null;
       }
       return null;
     }
