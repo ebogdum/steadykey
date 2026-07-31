@@ -63,6 +63,19 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
     }
   }
 
+  /**
+   * The `key` column is a VARCHAR of a fixed width. A longer key would be
+   * silently truncated by a non-strict server, aliasing two distinct
+   * idempotency keys onto the same row, so reject it instead.
+   */
+  private assertKeyFits(key: string): void {
+    if (key.length > this.keyLength) {
+      throw new IdempotencyError(
+        `Key exceeds the configured MySQL keyLength of ${this.keyLength} characters (received ${key.length})`,
+      );
+    }
+  }
+
   private async ensureTable(): Promise<void> {
     const ddl = `
       CREATE TABLE IF NOT EXISTS ${this.table} (
@@ -76,6 +89,7 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
   }
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
+    this.assertKeyFits(key);
     await this.ready;
     const expiresAt = futureDate(ttlSeconds);
     await this.client.execute<MySqlResult>(
@@ -91,6 +105,7 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
   }
 
   async get(key: string): Promise<IdempotencyStoreValue | null> {
+    this.assertKeyFits(key);
     await this.ready;
     const [rows] = await this.client.execute<MySqlRow[]>(
       `SELECT \`value\`, \`expires_at\` FROM ${this.table} WHERE \`key\` = ? AND ${CURRENT_CONDITION} LIMIT 1`,
@@ -109,6 +124,7 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
   }
 
   async update(key: string, value: string, ttlSeconds: number | null): Promise<void> {
+    this.assertKeyFits(key);
     await this.ready;
     const expiresAt = futureDate(ttlSeconds);
     const [result] = await this.client.execute<MySqlResult>(
@@ -125,6 +141,7 @@ export class MySqlIdempotencyStore implements IdempotencyStore {
   }
 
   async delete(key: string): Promise<boolean> {
+    this.assertKeyFits(key);
     await this.ready;
     const [result] = await this.client.execute<MySqlResult>(
       `DELETE FROM ${this.table} WHERE \`key\` = ?`,

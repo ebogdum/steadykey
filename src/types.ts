@@ -45,6 +45,12 @@ export interface IdempotencyManagerOptions {
   readonly storeCanonicalPayload?: boolean;
   readonly slidingTtl?: boolean;
   readonly events?: IdempotencyEvents;
+  /**
+   * Maximum length, in characters, accepted for the key prefix, a namespace, or
+   * an idempotency id. Guards against unbounded client-supplied keys. Defaults
+   * to 512.
+   */
+  readonly maxKeyLength?: number;
 }
 
 export interface IdempotencyRegisterOptions extends KeyDerivationOptions {

@@ -157,7 +157,9 @@ import { fastifyIdempotency } from "steadykey/middleware";
 await app.register(fastifyIdempotency(manager, { ttlSeconds: 86_400 }));
 ```
 
-Options: `{ headerName?, required?, methods?, ttlSeconds?, namespace?, fingerprint?, shouldStore?, replayHeader?, execute? }`.
+Options: `{ headerName?, required?, methods?, ttlSeconds?, namespace?, fingerprint?, shouldStore?, replayHeader?, maxBodyBytes?, leaseSeconds?, execute? }`.
+
+`maxBodyBytes` (default 1 MiB) caps the response body that will be buffered and cached — a larger response streams through untouched and is not stored, so a streaming or bulk-export endpoint cannot be used to exhaust memory or the backing store. `leaseSeconds` (default 30, Fastify plugin only) bounds how long the `pending` placeholder holds a key, so a request aborted mid-flight cannot lock the key indefinitely.
 
 ## Backends
 
@@ -205,7 +207,7 @@ const tiered = new CompositeIdempotencyStore({
 ```ts
 new IdempotencyManager(store, {
   keyPrefix?, namespace?, defaultTtlSeconds?, hashAlgorithm?, hashFn?,
-  storeCanonicalPayload?, slidingTtl?, events?,
+  storeCanonicalPayload?, slidingTtl?, events?, maxKeyLength?,
 });
 ```
 
@@ -221,6 +223,7 @@ new IdempotencyManager(store, {
 | `generateId(payload, options?)` | The derived id, without touching the store. |
 | `updateTtl(id, ttlSeconds, options?)` | Refresh, set, or remove a TTL (`null`/`0` = persistent). |
 | `clear(id, options?)` | Delete a record. Returns `true` if one was removed. |
+| `getDefaultTtlSeconds()` | The TTL applied when a call does not specify one. |
 
 Derivation options (`namespace`, `idempotencyKey`, `ignoreFields`, `pickFields`) apply to `execute`, `register`, `lookupByPayload`, `generateId`, and `exists`.
 
@@ -245,8 +248,15 @@ Event handlers are best-effort — a throwing handler never disrupts an operatio
 
 - **Injective canonicalization.** Distinct value types never share a key, JSON keys such as `__proto__` are preserved (never dropped or used to pollute a prototype), non-finite numbers and invalid dates are rejected, and deeply nested payloads are bounded.
 - **Injection-safe backends.** SQL table names are strictly validated and quoted, and every value and timestamp is a bound parameter. Configurable lengths are range-checked.
+- **Unambiguous key composition.** Each key segment is percent-encoded, so a client-supplied idempotency key can never impersonate another namespace, and the composed key is always safe for whitespace-sensitive wire protocols such as the Memcached text protocol. Segment lengths are capped (`maxKeyLength`, default 512), and a store that cannot hold a key faithfully — Memcached past 250 bytes, MySQL past its `key` column — rejects it rather than truncating it into a collision.
+- **Bounded resource use.** The HTTP middlewares cap the response body they buffer and cache (`maxBodyBytes`), and the Fastify plugin holds a key with a short lease (`leaseSeconds`) so an aborted request cannot lock it or grow the store without bound.
+- **Constant-time hash comparison.** Payload-fingerprint comparisons do not leak how many leading characters matched.
 - **No ambient behavior.** steadykey never logs, reads environment variables, or makes network calls of its own — it only talks to the client you hand it.
 - **Trust boundary.** Records read back from a store are trusted to have the shape steadykey wrote. A store that untrusted parties can write to is outside the threat model.
+
+## Upgrading from 2.x
+
+3.0 is a security release. `buildKey()` now percent-encodes each key segment, so **keys change for ids or namespaces containing `:`, `%`, whitespace, control characters, or non-ASCII** — a hex hash or UUID is unaffected. Drain or expire those entries before deploying. The MySQL store now rejects keys longer than its `key` column instead of letting the server truncate them: if you pass keys longer than 128 characters, set `keyLength` explicitly and widen the column with `ALTER TABLE`. Payloads containing a `Map` with non-string keys also produce different keys, now that Map keys are canonicalized structurally. See the [changelog](CHANGELOG.md) for the full list.
 
 ## Upgrading from 1.x
 

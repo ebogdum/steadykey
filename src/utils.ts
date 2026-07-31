@@ -78,7 +78,13 @@ const normalize = (value: unknown, depth: number): CanonicalJsonValue => {
 
   if (value instanceof Map) {
     const entries = Array.from(value.entries())
-      .map(([entryKey, entryValue]) => [String(entryKey), normalize(entryValue, depth + 1)] as const)
+      .map(
+        ([entryKey, entryValue]) =>
+          [
+            JSON.stringify(normalize(entryKey, depth + 1)),
+            normalize(entryValue, depth + 1),
+          ] as const,
+      )
       .sort(([keyA], [keyB]) => compareCodeUnits(keyA, keyB));
     return `${MAP_PREFIX}${JSON.stringify(entries)}`;
   }

@@ -1,5 +1,5 @@
 import { IdempotencyManager } from "./idempotency-manager.js";
-import { IdempotencyCollisionError, IdempotencyInProgressError } from "./errors.js";
+import { IdempotencyCollisionError, IdempotencyError, IdempotencyInProgressError } from "./errors.js";
 import type { IdempotencyExecuteOptions, JsonValue } from "./types.js";
 
 export interface StoredHttpResponse {
@@ -18,6 +18,19 @@ export interface IdempotencyMiddlewareOptions {
   readonly shouldStore?: (response: StoredHttpResponse) => boolean;
   readonly replayHeader?: string;
   readonly execute?: Partial<IdempotencyExecuteOptions>;
+  /**
+   * Maximum response body size, in bytes, that will be buffered and cached.
+   * A response that grows past this limit is streamed through untouched and is
+   * never stored, so a large or streaming endpoint cannot be used to exhaust
+   * process memory or the backing store. Defaults to 1 MiB.
+   */
+  readonly maxBodyBytes?: number;
+  /**
+   * Lifetime of the `pending` placeholder record written before the handler
+   * runs (Fastify plugin only). Bounds how long a key stays locked if the
+   * connection is aborted or the process dies mid-request. Defaults to 30s.
+   */
+  readonly leaseSeconds?: number;
 }
 
 export interface HttpRequestLike {
@@ -41,6 +54,49 @@ export type NextFunction = (error?: unknown) => void;
 const DEFAULT_METHODS = ["POST", "PUT", "PATCH", "DELETE"];
 const DEFAULT_HEADER = "idempotency-key";
 const DEFAULT_REPLAY_HEADER = "idempotent-replayed";
+const DEFAULT_MAX_BODY_BYTES = 1_048_576;
+const DEFAULT_LEASE_SECONDS = 30;
+
+const resolveMaxBodyBytes = (maxBodyBytes: number | undefined): number => {
+  if (maxBodyBytes === undefined) {
+    return DEFAULT_MAX_BODY_BYTES;
+  }
+  if (!Number.isInteger(maxBodyBytes) || maxBodyBytes < 1) {
+    throw new IdempotencyError("maxBodyBytes must be a positive integer when provided");
+  }
+  return maxBodyBytes;
+};
+
+const resolveLeaseSeconds = (leaseSeconds: number | undefined): number => {
+  if (leaseSeconds === undefined) {
+    return DEFAULT_LEASE_SECONDS;
+  }
+  if (!Number.isInteger(leaseSeconds) || leaseSeconds < 1) {
+    throw new IdempotencyError("leaseSeconds must be a positive integer when provided");
+  }
+  return leaseSeconds;
+};
+
+/**
+ * A cached record is only replayed if it really is a captured HTTP response.
+ * Anything else (a record written through another code path that shares the key
+ * space, or a corrupted entry) is ignored rather than turned into a malformed
+ * reply.
+ */
+const isStoredHttpResponse = (value: unknown): value is StoredHttpResponse => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.status === "number" &&
+    Number.isInteger(candidate.status) &&
+    candidate.status >= 100 &&
+    candidate.status <= 599 &&
+    typeof candidate.body === "string" &&
+    (candidate.contentType === undefined || typeof candidate.contentType === "string")
+  );
+};
 
 class NonCacheableResponse extends Error {
   constructor(public readonly response: StoredHttpResponse) {
@@ -57,21 +113,36 @@ const resolveNamespace = (
   request: HttpRequestLike,
 ): string | undefined => (typeof option === "function" ? option(request) : option);
 
-const installCapture = (res: HttpResponseLike) => {
-  const chunks: Buffer[] = [];
+const installCapture = (res: HttpResponseLike, maxBodyBytes: number) => {
+  let chunks: Buffer[] = [];
+  let bufferedBytes = 0;
+  let overflowed = false;
   const originalWrite = res.write.bind(res);
   const originalEnd = res.end.bind(res);
 
-  res.write = (chunk: unknown, ...rest: unknown[]): boolean => {
-    if (chunk) {
-      chunks.push(Buffer.from(chunk as Buffer | string));
+  const buffer = (chunk: unknown): void => {
+    if (!chunk || overflowed) {
+      return;
     }
+    const encoded = Buffer.from(chunk as Buffer | string);
+    if (bufferedBytes + encoded.length > maxBodyBytes) {
+      // Past the cap the response is no longer cacheable; drop what we hold so
+      // an oversized body cannot pin memory for the life of the request.
+      overflowed = true;
+      chunks = [];
+      bufferedBytes = 0;
+      return;
+    }
+    chunks.push(encoded);
+    bufferedBytes += encoded.length;
+  };
+
+  res.write = (chunk: unknown, ...rest: unknown[]): boolean => {
+    buffer(chunk);
     return originalWrite(chunk, ...rest);
   };
   res.end = (chunk?: unknown, ...rest: unknown[]): unknown => {
-    if (chunk) {
-      chunks.push(Buffer.from(chunk as Buffer | string));
-    }
+    buffer(chunk);
     return originalEnd(chunk, ...rest);
   };
 
@@ -81,6 +152,7 @@ const installCapture = (res: HttpResponseLike) => {
   };
 
   return {
+    hasOverflowed: (): boolean => overflowed,
     snapshot: (): StoredHttpResponse => ({
       status: res.statusCode,
       body: Buffer.concat(chunks).toString("utf8"),
@@ -105,6 +177,7 @@ export const createIdempotencyMiddleware = (
   const methods = new Set((options.methods ?? DEFAULT_METHODS).map((method) => method.toUpperCase()));
   const shouldStore = options.shouldStore ?? ((response: StoredHttpResponse) => response.status < 500);
   const replayHeader = options.replayHeader ?? DEFAULT_REPLAY_HEADER;
+  const maxBodyBytes = resolveMaxBodyBytes(options.maxBodyBytes);
 
   return async (req: HttpRequestLike, res: HttpResponseLike, next: NextFunction): Promise<void> => {
     if (!methods.has((req.method ?? "GET").toUpperCase())) {
@@ -126,7 +199,7 @@ export const createIdempotencyMiddleware = (
 
     const fingerprint = options.fingerprint ? options.fingerprint(req) : req.body ?? null;
     const namespace = resolveNamespace(options.namespace, req);
-    const capture = installCapture(res);
+    const capture = installCapture(res, maxBodyBytes);
 
     const operation = (): Promise<StoredHttpResponse> =>
       new Promise<StoredHttpResponse>((resolve, reject) => {
@@ -137,7 +210,7 @@ export const createIdempotencyMiddleware = (
           }
           settled = true;
           const snapshot = capture.snapshot();
-          if (!fromClose && shouldStore(snapshot)) {
+          if (!fromClose && !capture.hasOverflowed() && shouldStore(snapshot)) {
             resolve(snapshot);
           } else {
             reject(new NonCacheableResponse(snapshot));
@@ -163,6 +236,12 @@ export const createIdempotencyMiddleware = (
         ...options.execute,
       });
       if (result.fromCache) {
+        if (!isStoredHttpResponse(result.value)) {
+          // The stored record is not a captured response; run the handler
+          // rather than emitting a malformed reply from it.
+          next();
+          return;
+        }
         capture.replay(result.value, replayHeader);
       }
     } catch (error) {
@@ -214,6 +293,15 @@ export interface FastifyInstanceLike {
 
 const STATE = Symbol("steadykey.idempotency.state");
 
+/**
+ * The TTL the completed record should carry, replacing the short lease used for
+ * the pending placeholder.
+ */
+const finalTtlSeconds = (
+  manager: IdempotencyManager,
+  options: IdempotencyMiddlewareOptions,
+): number | null => (options.ttlSeconds === undefined ? manager.getDefaultTtlSeconds() : options.ttlSeconds);
+
 interface FastifyState {
   readonly id: string;
   readonly namespace?: string;
@@ -225,9 +313,10 @@ export const fastifyIdempotency = (manager: IdempotencyManager, options: Idempot
   const methods = new Set((options.methods ?? DEFAULT_METHODS).map((method) => method.toUpperCase()));
   const shouldStore = options.shouldStore ?? ((response: StoredHttpResponse) => response.status < 500);
   const replayHeader = options.replayHeader ?? DEFAULT_REPLAY_HEADER;
+  const maxBodyBytes = resolveMaxBodyBytes(options.maxBodyBytes);
+  const leaseSeconds = resolveLeaseSeconds(options.leaseSeconds);
 
-  const replay = (reply: FastifyReplyLike, stored: JsonValue): unknown => {
-    const response = stored as unknown as StoredHttpResponse;
+  const replay = (reply: FastifyReplyLike, response: StoredHttpResponse): unknown => {
     reply.code(response.status);
     if (response.contentType) {
       reply.header("content-type", response.contentType);
@@ -259,7 +348,10 @@ export const fastifyIdempotency = (manager: IdempotencyManager, options: Idempot
           idempotencyKey: key,
           namespace,
           status: "pending",
-          ttlSeconds: options.ttlSeconds,
+          // The placeholder only holds the key until `onSend` writes the real
+          // record. A short lease keeps an aborted or crashed request from
+          // locking the key — and filling the store — indefinitely.
+          ttlSeconds: leaseSeconds,
         });
       } catch (error) {
         if (error instanceof IdempotencyCollisionError) {
@@ -276,7 +368,11 @@ export const fastifyIdempotency = (manager: IdempotencyManager, options: Idempot
 
       const status = acquired.record.status ?? "completed";
       if (status === "completed") {
-        return replay(reply, acquired.record.result ?? null);
+        if (isStoredHttpResponse(acquired.record.result)) {
+          return replay(reply, acquired.record.result);
+        }
+        // Not a captured response — fall through and run the handler normally.
+        return undefined;
       }
       if (status === "failed") {
         await manager.clear(acquired.id, { namespace });
@@ -293,13 +389,20 @@ export const fastifyIdempotency = (manager: IdempotencyManager, options: Idempot
         return payload;
       }
       const contentType = reply.getHeader("content-type");
+      const body = typeof payload === "string" ? payload : String(payload ?? "");
       const stored: StoredHttpResponse = {
         status: reply.statusCode,
-        body: typeof payload === "string" ? payload : String(payload ?? ""),
+        body,
         contentType: typeof contentType === "string" ? contentType : undefined,
       };
-      if (shouldStore(stored)) {
-        await manager.complete(state.id, stored as unknown as JsonValue, { namespace: state.namespace }).catch(() => undefined);
+      const withinLimit = Buffer.byteLength(body, "utf8") <= maxBodyBytes;
+      if (withinLimit && shouldStore(stored)) {
+        await manager
+          .complete(state.id, stored as unknown as JsonValue, {
+            namespace: state.namespace,
+            ttlSeconds: finalTtlSeconds(manager, options),
+          })
+          .catch(() => undefined);
       } else {
         await manager.clear(state.id, { namespace: state.namespace }).catch(() => undefined);
       }

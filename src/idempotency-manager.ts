@@ -1,6 +1,8 @@
 import { randomUUID } from "crypto";
 import { canonicalize, deserializeRecord, hashCanonicalValue, serializeRecord } from "./utils.js";
 import { projectPayload } from "./internal/project.js";
+import { assertKeyLength, assertSafeKeyPrefix, encodeKeySegment, resolveMaxKeyLength } from "./internal/key.js";
+import { constantTimeEquals } from "./internal/compare.js";
 import { IdempotencyCollisionError, IdempotencyError, IdempotencyInProgressError } from "./errors.js";
 import type {
   FailureMode,
@@ -87,6 +89,7 @@ export class IdempotencyManager {
   private readonly storeCanonicalPayload: boolean;
   private readonly slidingTtl: boolean;
   private readonly events?: IdempotencyEvents;
+  private readonly maxKeyLength: number;
 
   constructor(store: IdempotencyStore, options: IdempotencyManagerOptions = {}) {
     if (!store) {
@@ -94,7 +97,10 @@ export class IdempotencyManager {
     }
 
     this.store = store;
+    this.maxKeyLength = resolveMaxKeyLength(options.maxKeyLength);
     this.keyPrefix = options.keyPrefix?.replace(/:+$/, "") ?? DEFAULT_PREFIX;
+    assertSafeKeyPrefix(this.keyPrefix);
+    assertKeyLength("keyPrefix", this.keyPrefix, this.maxKeyLength);
     this.namespace = options.namespace;
     const defaultTtl = options.defaultTtlSeconds;
     if (defaultTtl === undefined || defaultTtl === null) {
@@ -120,7 +126,18 @@ export class IdempotencyManager {
   }
 
   public buildKey(id: string, namespace: string | undefined = this.namespace): string {
-    return namespace ? `${this.keyPrefix}:${namespace}:${id}` : `${this.keyPrefix}:${id}`;
+    assertKeyLength("Idempotency id", id, this.maxKeyLength);
+    const encodedId = encodeKeySegment(id);
+    if (namespace === undefined) {
+      return `${this.keyPrefix}:${encodedId}`;
+    }
+    assertKeyLength("Namespace", namespace, this.maxKeyLength);
+    return `${this.keyPrefix}:${encodeKeySegment(namespace)}:${encodedId}`;
+  }
+
+  /** The TTL applied when a call does not specify one. */
+  public getDefaultTtlSeconds(): number | null {
+    return this.defaultTtlSeconds;
   }
 
   public async register(
@@ -203,7 +220,7 @@ export class IdempotencyManager {
       }
 
       const record = deserializeRecord(existing.value);
-      if (record.payloadHash !== derived.payloadHash) {
+      if (!constantTimeEquals(record.payloadHash, derived.payloadHash)) {
         this.emit("onCollision", { id: derived.id, key: derived.key, namespace: derived.namespace });
         throw new IdempotencyCollisionError(`Collision detected for key ${derived.key}`);
       }
@@ -362,7 +379,7 @@ export class IdempotencyManager {
       throw new IdempotencyError("Failed to persist idempotency record due to concurrent deletion");
     }
     const existingRecord = deserializeRecord(existingValue.value);
-    if (existingRecord.payloadHash !== derived.payloadHash) {
+    if (!constantTimeEquals(existingRecord.payloadHash, derived.payloadHash)) {
       this.emit("onCollision", { id: derived.id, key: derived.key, namespace: derived.namespace });
       throw new IdempotencyCollisionError(`Collision detected for key ${derived.key}`);
     }
@@ -449,7 +466,7 @@ export class IdempotencyManager {
         return { kind: "gone" };
       }
       const record = deserializeRecord(current.value);
-      if (record.payloadHash !== derived.payloadHash) {
+      if (!constantTimeEquals(record.payloadHash, derived.payloadHash)) {
         return { kind: "collision" };
       }
       const status: IdempotencyStatus = record.status ?? "completed";

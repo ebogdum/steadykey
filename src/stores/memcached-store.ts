@@ -1,5 +1,11 @@
 import { IdempotencyError } from "../errors.js";
+import { assertStorableKey } from "../internal/key.js";
 import type { IdempotencyStore, IdempotencyStoreValue, MemcachedClientLike } from "../types.js";
+
+/** The Memcached protocol caps keys at 250 bytes and forbids whitespace and control characters. */
+const MAX_KEY_BYTES = 250;
+
+const assertKey = (key: string): void => assertStorableKey(key, MAX_KEY_BYTES, "Memcached");
 
 const wrap = <T>(invoke: (callback: (error: unknown, result: T) => void) => void): Promise<T> =>
   new Promise<T>((resolve, reject) => {
@@ -31,13 +37,15 @@ export class MemcachedIdempotencyStore implements IdempotencyStore {
   }
 
   async setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean> {
+    assertKey(key);
     const lifetime = lifetimeFromTtl(ttlSeconds);
-  const success = await wrap<boolean | string>((callback) => this.client.add(key, value, lifetime, callback));
-  return Boolean(success);
+    const success = await wrap<boolean | string>((callback) => this.client.add(key, value, lifetime, callback));
+    return Boolean(success);
   }
 
   async get(key: string): Promise<IdempotencyStoreValue | null> {
-  const data = await wrap<string | undefined | null>((callback) => this.client.get(key, callback));
+    assertKey(key);
+    const data = await wrap<string | undefined | null>((callback) => this.client.get(key, callback));
     if (data === undefined || data === null) {
       return null;
     }
@@ -45,6 +53,7 @@ export class MemcachedIdempotencyStore implements IdempotencyStore {
   }
 
   async update(key: string, value: string, ttlSeconds: number | null): Promise<void> {
+    assertKey(key);
     const lifetime = lifetimeFromTtl(ttlSeconds);
     const success = await wrap<boolean | string>((callback) => this.client.set(key, value, lifetime, callback));
     if (!success) {
@@ -53,6 +62,7 @@ export class MemcachedIdempotencyStore implements IdempotencyStore {
   }
 
   async delete(key: string): Promise<boolean> {
+    assertKey(key);
     const success = await wrap<boolean | string>((callback) => this.client.del(key, callback));
     return Boolean(success);
   }
