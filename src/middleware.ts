@@ -98,6 +98,25 @@ const isStoredHttpResponse = (value: unknown): value is StoredHttpResponse => {
   );
 };
 
+/**
+ * A captured body is stored as a UTF-8 string. Bytes that are not valid UTF-8 —
+ * an image, a gzip frame — do not survive that round trip, so a response
+ * carrying them must not be cached rather than be replayed corrupted.
+ *
+ * A strict decoder answers this in one pass, without materializing a second
+ * copy of the body just to compare against.
+ */
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+const isLosslessUtf8 = (raw: Buffer): boolean => {
+  try {
+    strictUtf8.decode(raw);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 class NonCacheableResponse extends Error {
   constructor(public readonly response: StoredHttpResponse) {
     super("non-cacheable response");
@@ -116,21 +135,47 @@ const resolveNamespace = (
 const installCapture = (res: HttpResponseLike, maxBodyBytes: number) => {
   let chunks: Buffer[] = [];
   let bufferedBytes = 0;
-  let overflowed = false;
+  /** Set when the body can no longer be stored faithfully: too large, or not encodable. */
+  let uncacheable = false;
+  let joined: Buffer | null = null;
   const originalWrite = res.write.bind(res);
   const originalEnd = res.end.bind(res);
 
-  const buffer = (chunk: unknown): void => {
-    if (!chunk || overflowed) {
+  const abandon = (): void => {
+    uncacheable = true;
+    chunks = [];
+    bufferedBytes = 0;
+    joined = null;
+  };
+
+  const buffer = (chunk: unknown, rest: unknown[]): void => {
+    if (!chunk || uncacheable) {
       return;
     }
-    const encoded = Buffer.from(chunk as Buffer | string);
+    let encoded: Buffer;
+    try {
+      if (typeof chunk === "string") {
+        // `res.write(chunk, encoding)` — reading a string as UTF-8 regardless of
+        // the encoding it was written with would corrupt the captured copy. The
+        // second argument may also be a callback, or an encoding this runtime
+        // does not know.
+        const candidate = rest[0];
+        const encoding: BufferEncoding =
+          typeof candidate === "string" && Buffer.isEncoding(candidate) ? (candidate as BufferEncoding) : "utf8";
+        encoded = Buffer.from(chunk, encoding);
+      } else {
+        encoded = Buffer.from(chunk as Buffer);
+      }
+    } catch {
+      // Capturing must never break the response it is observing; give up on
+      // caching this one instead.
+      abandon();
+      return;
+    }
     if (bufferedBytes + encoded.length > maxBodyBytes) {
-      // Past the cap the response is no longer cacheable; drop what we hold so
-      // an oversized body cannot pin memory for the life of the request.
-      overflowed = true;
-      chunks = [];
-      bufferedBytes = 0;
+      // Past the cap, drop what we hold so an oversized body cannot pin memory
+      // for the life of the request.
+      abandon();
       return;
     }
     chunks.push(encoded);
@@ -138,11 +183,11 @@ const installCapture = (res: HttpResponseLike, maxBodyBytes: number) => {
   };
 
   res.write = (chunk: unknown, ...rest: unknown[]): boolean => {
-    buffer(chunk);
+    buffer(chunk, rest);
     return originalWrite(chunk, ...rest);
   };
   res.end = (chunk?: unknown, ...rest: unknown[]): unknown => {
-    buffer(chunk);
+    buffer(chunk, rest);
     return originalEnd(chunk, ...rest);
   };
 
@@ -151,11 +196,17 @@ const installCapture = (res: HttpResponseLike, maxBodyBytes: number) => {
     return typeof header === "string" ? header : undefined;
   };
 
+  /** Concatenated once, then reused by both the cacheability check and the snapshot. */
+  const body = (): Buffer => {
+    joined ??= Buffer.concat(chunks);
+    return joined;
+  };
+
   return {
-    hasOverflowed: (): boolean => overflowed,
+    isCacheable: (): boolean => !uncacheable && isLosslessUtf8(body()),
     snapshot: (): StoredHttpResponse => ({
       status: res.statusCode,
-      body: Buffer.concat(chunks).toString("utf8"),
+      body: body().toString("utf8"),
       contentType: contentTypeOf(),
     }),
     replay: (stored: StoredHttpResponse, replayHeader: string): void => {
@@ -210,7 +261,7 @@ export const createIdempotencyMiddleware = (
           }
           settled = true;
           const snapshot = capture.snapshot();
-          if (!fromClose && !capture.hasOverflowed() && shouldStore(snapshot)) {
+          if (!fromClose && capture.isCacheable() && shouldStore(snapshot)) {
             resolve(snapshot);
           } else {
             reject(new NonCacheableResponse(snapshot));
@@ -293,11 +344,25 @@ export interface FastifyInstanceLike {
 
 const STATE = Symbol("steadykey.idempotency.state");
 
+/** The payload as a storable UTF-8 string, or `null` if it cannot be stored faithfully. */
+const cacheableBody = (payload: unknown): string | null => {
+  if (typeof payload === "string") {
+    return payload;
+  }
+  if (payload === null || payload === undefined) {
+    return "";
+  }
+  if (Buffer.isBuffer(payload)) {
+    return isLosslessUtf8(payload) ? payload.toString("utf8") : null;
+  }
+  return null;
+};
+
 /**
- * The TTL the completed record should carry, replacing the short lease used for
+ * The TTL a completed record should carry, replacing the short lease used for
  * the pending placeholder.
  */
-const finalTtlSeconds = (
+const resolveFinalTtl = (
   manager: IdempotencyManager,
   options: IdempotencyMiddlewareOptions,
 ): number | null => (options.ttlSeconds === undefined ? manager.getDefaultTtlSeconds() : options.ttlSeconds);
@@ -315,6 +380,7 @@ export const fastifyIdempotency = (manager: IdempotencyManager, options: Idempot
   const replayHeader = options.replayHeader ?? DEFAULT_REPLAY_HEADER;
   const maxBodyBytes = resolveMaxBodyBytes(options.maxBodyBytes);
   const leaseSeconds = resolveLeaseSeconds(options.leaseSeconds);
+  const finalTtl = resolveFinalTtl(manager, options);
 
   const replay = (reply: FastifyReplyLike, response: StoredHttpResponse): unknown => {
     reply.code(response.status);
@@ -389,18 +455,21 @@ export const fastifyIdempotency = (manager: IdempotencyManager, options: Idempot
         return payload;
       }
       const contentType = reply.getHeader("content-type");
-      const body = typeof payload === "string" ? payload : String(payload ?? "");
+      // Anything that is not a string or a lossless-UTF-8 buffer — a stream, an
+      // image — cannot be stored faithfully, and `String(payload)` would cache
+      // "[object Object]" and replay that to every duplicate.
+      const body = cacheableBody(payload);
       const stored: StoredHttpResponse = {
         status: reply.statusCode,
-        body,
+        body: body ?? "",
         contentType: typeof contentType === "string" ? contentType : undefined,
       };
-      const withinLimit = Buffer.byteLength(body, "utf8") <= maxBodyBytes;
+      const withinLimit = body !== null && Buffer.byteLength(body, "utf8") <= maxBodyBytes;
       if (withinLimit && shouldStore(stored)) {
         await manager
           .complete(state.id, stored as unknown as JsonValue, {
             namespace: state.namespace,
-            ttlSeconds: finalTtlSeconds(manager, options),
+            ttlSeconds: finalTtl,
           })
           .catch(() => undefined);
       } else {

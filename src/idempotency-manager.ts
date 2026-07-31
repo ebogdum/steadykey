@@ -6,6 +6,7 @@ import { constantTimeEquals } from "./internal/compare.js";
 import { IdempotencyCollisionError, IdempotencyError, IdempotencyInProgressError } from "./errors.js";
 import type {
   FailureMode,
+  IdempotencyStoreValue,
   HashAlgorithm,
   HashFunction,
   IdempotencyEvents,
@@ -32,6 +33,15 @@ const DEFAULT_HASH_ALGORITHM: HashAlgorithm = "sha256";
 const DEFAULT_LEASE_SECONDS = 30;
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
+/**
+ * Ceiling for the poll interval. Waiters back off toward it so that a long wait
+ * costs a handful of reads rather than one per `pollIntervalMs` for the whole
+ * timeout — which, multiplied by every duplicate request, is an amplification
+ * attack on the store.
+ */
+const MAX_POLL_INTERVAL_MS = 1_000;
+
+const backOff = (intervalMs: number): number => Math.min(intervalMs * 2, MAX_POLL_INTERVAL_MS);
 
 const isFiniteTtl = (ttlSeconds: number | null | undefined): ttlSeconds is number =>
   typeof ttlSeconds === "number" && Number.isFinite(ttlSeconds) && ttlSeconds > 0;
@@ -186,6 +196,18 @@ export class IdempotencyManager {
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const storeCanonicalPayload = options.storeCanonicalPayload ?? this.storeCanonicalPayload;
     const deadline = Date.now() + waitTimeoutMs;
+    let retryIntervalMs = pollIntervalMs;
+
+    // Every path that loops back must respect `deadline`, otherwise a caller
+    // could spin here indefinitely while contending for a key that keeps being
+    // reclaimed by another worker.
+    const retryAfterBackoff = async (): Promise<void> => {
+      if (Date.now() > deadline) {
+        throw new IdempotencyInProgressError(derived.id, derived.key, "Timed out acquiring idempotency lease");
+      }
+      await sleep(retryIntervalMs);
+      retryIntervalMs = backOff(retryIntervalMs);
+    };
 
     for (;;) {
       const attemptId = randomUUID();
@@ -210,12 +232,9 @@ export class IdempotencyManager {
         });
       }
 
-      const existing = await this.store.get(derived.key);
+      const existing = await this.readForCoordination(derived.key);
       if (!existing) {
-        if (Date.now() > deadline) {
-          throw new IdempotencyInProgressError(derived.id, derived.key, "Timed out acquiring idempotency lease");
-        }
-        await sleep(pollIntervalMs);
+        await retryAfterBackoff();
         continue;
       }
 
@@ -236,6 +255,7 @@ export class IdempotencyManager {
           throw reconstructError(record.error);
         }
         await this.store.delete(derived.key);
+        await retryAfterBackoff();
         continue;
       }
 
@@ -243,8 +263,9 @@ export class IdempotencyManager {
         throw new IdempotencyInProgressError(derived.id, derived.key);
       }
 
-      const settled = await this.waitForSettle(derived, deadline, pollIntervalMs);
+      const settled = await this.waitForSettle(derived, deadline, retryIntervalMs);
       if (settled.kind === "gone") {
+        await retryAfterBackoff();
         continue;
       }
       if (settled.kind === "collision") {
@@ -260,6 +281,7 @@ export class IdempotencyManager {
           throw reconstructError(settled.record.error);
         }
         await this.store.delete(derived.key);
+        await retryAfterBackoff();
         continue;
       }
       throw new IdempotencyInProgressError(derived.id, derived.key, "Timed out waiting for in-flight operation to complete");
@@ -373,8 +395,20 @@ export class IdempotencyManager {
     return this.hashFn ? this.hashFn(canonicalPayload) : hashCanonicalValue(canonicalPayload, this.hashAlgorithm);
   }
 
+  /**
+   * A read used for coordination rather than lookup. Records mutate while an
+   * operation is in flight, so these reads must never come from a stale cache
+   * tier; see `IdempotencyStore.getConsistent`.
+   */
+  private async readForCoordination(key: string): Promise<IdempotencyStoreValue | null> {
+    if (this.store.getConsistent) {
+      return this.store.getConsistent(key);
+    }
+    return this.store.get(key);
+  }
+
   private async readExisting(derived: DerivedKey): Promise<IdempotencyRecord> {
-    const existingValue = await this.store.get(derived.key);
+    const existingValue = await this.readForCoordination(derived.key);
     if (!existingValue) {
       throw new IdempotencyError("Failed to persist idempotency record due to concurrent deletion");
     }
@@ -433,7 +467,7 @@ export class IdempotencyManager {
     record: IdempotencyRecord,
     ttlSeconds: number | null,
   ): Promise<void> {
-    const current = await this.store.get(key);
+    const current = await this.readForCoordination(key);
     if (!current) {
       return;
     }
@@ -445,7 +479,7 @@ export class IdempotencyManager {
   }
 
   private async release(key: string, attemptId: string): Promise<void> {
-    const current = await this.store.get(key);
+    const current = await this.readForCoordination(key);
     if (!current) {
       return;
     }
@@ -456,12 +490,14 @@ export class IdempotencyManager {
   }
 
   private async waitForSettle(derived: DerivedKey, deadline: number, pollIntervalMs: number): Promise<SettleResult> {
+    let intervalMs = pollIntervalMs;
     for (;;) {
       if (Date.now() > deadline) {
         return { kind: "timeout" };
       }
-      await sleep(pollIntervalMs);
-      const current = await this.store.get(derived.key);
+      await sleep(intervalMs);
+      intervalMs = backOff(intervalMs);
+      const current = await this.readForCoordination(derived.key);
       if (!current) {
         return { kind: "gone" };
       }

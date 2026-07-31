@@ -15,12 +15,10 @@ export interface RedisClientLike {
   del(key: string): Promise<number>;
 }
 
-const toTtlSeconds = (ttl: number): number | null => {
-  if (ttl < 0) {
-    return null;
-  }
-  return ttl;
-};
+/** Redis replies -1 for "no expiry" and -2 for "no such key". */
+const KEY_MISSING = -2;
+
+const toTtlSeconds = (ttl: number): number | null => (ttl < 0 ? null : ttl);
 
 export class RedisIdempotencyStore implements IdempotencyStore {
   constructor(private readonly redis: RedisClientLike) {
@@ -44,6 +42,11 @@ export class RedisIdempotencyStore implements IdempotencyStore {
       return null;
     }
     const ttl = await this.redis.ttl(key);
+    if (ttl === KEY_MISSING) {
+      // The key expired between the GET and the TTL; report it as gone rather
+      // than as a record that never expires.
+      return null;
+    }
     return { value, ttlSeconds: toTtlSeconds(ttl) };
   }
 

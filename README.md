@@ -161,6 +161,8 @@ Options: `{ headerName?, required?, methods?, ttlSeconds?, namespace?, fingerpri
 
 `maxBodyBytes` (default 1 MiB) caps the response body that will be buffered and cached — a larger response streams through untouched and is not stored, so a streaming or bulk-export endpoint cannot be used to exhaust memory or the backing store. `leaseSeconds` (default 30, Fastify plugin only) bounds how long the `pending` placeholder holds a key, so a request aborted mid-flight cannot lock the key indefinitely.
 
+Cached bodies are stored as UTF-8 text. A response whose bytes are not valid UTF-8 — an image, a gzip frame, a stream — is sent to the client untouched but is **not** cached, since replaying it from a string would corrupt it. Idempotency for a binary endpoint is better expressed by caching a small JSON descriptor and serving the bytes from storage.
+
 ## Backends
 
 Every adapter is dependency-free — you pass in a client you already have, typed structurally.
@@ -202,6 +204,22 @@ const tiered = new CompositeIdempotencyStore({
 });
 ```
 
+`InMemoryIdempotencyStore` reclaims expired entries on an amortized schedule (by write volume, and by elapsed time so a traffic spike is released once it goes quiet). `purgeExpired()` forces a sweep and returns how many entries it dropped; `size` reports how many are held.
+
+### Writing your own store
+
+```ts
+interface IdempotencyStore {
+  setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean>;
+  get(key: string): Promise<IdempotencyStoreValue | null>;
+  update(key: string, value: string, ttlSeconds: number | null): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  getConsistent?(key: string): Promise<IdempotencyStoreValue | null>;
+}
+```
+
+`setIfAbsent` must be atomic — that is the whole guarantee. Implement the optional `getConsistent` **only if your store puts a cache in front of a shared backend**: a record mutates from `pending` to `completed` while an operation is in flight, and coordination reads (waiting on another worker, checking lease ownership before committing) must observe that transition rather than a cached copy. Stores without a cache tier omit it, and `get` is used instead.
+
 ## Manager API
 
 ```ts
@@ -210,6 +228,8 @@ new IdempotencyManager(store, {
   storeCanonicalPayload?, slidingTtl?, events?, maxKeyLength?,
 });
 ```
+
+`maxKeyLength` (default 512) caps the length of the key prefix, a namespace, and an idempotency id — worth keeping tight when the id comes from a client-supplied header.
 
 | Method | Description |
 |---|---|
@@ -226,6 +246,8 @@ new IdempotencyManager(store, {
 | `getDefaultTtlSeconds()` | The TTL applied when a call does not specify one. |
 
 Derivation options (`namespace`, `idempotencyKey`, `ignoreFields`, `pickFields`) apply to `execute`, `register`, `lookupByPayload`, `generateId`, and `exists`.
+
+`execute` additionally takes `leaseSeconds`, `inFlight`, `failureMode`, `storeResult`, `waitTimeoutMs`, and `pollIntervalMs`. A caller waiting on another worker starts at `pollIntervalMs` and backs off exponentially toward one second, so a long wait costs a handful of reads rather than one per interval for the whole timeout. Every wait is bounded by `waitTimeoutMs`, after which `IdempotencyInProgressError` is thrown.
 
 ## Events and observability
 

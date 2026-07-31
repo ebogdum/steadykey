@@ -34,10 +34,10 @@ export class MongoIdempotencyStore implements IdempotencyStore {
     if (!collection) {
       throw new IdempotencyError("MongoDB collection is required for MongoIdempotencyStore");
     }
-    if (options.ensureIndexes === false) {
+    if (options.ensureIndexes === false || !collection.createIndex) {
       this.ready = Promise.resolve();
     } else {
-      this.ready = this.collection
+      this.ready = collection
         .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
         .then(() => undefined)
         .catch(() => undefined);

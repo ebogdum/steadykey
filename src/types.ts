@@ -138,6 +138,17 @@ export interface IdempotencyStoreValue {
 export interface IdempotencyStore {
   setIfAbsent(key: string, value: string, ttlSeconds: number | null): Promise<boolean>;
   get(key: string): Promise<IdempotencyStoreValue | null>;
+  /**
+   * Optional read that must not be served from a stale tier.
+   *
+   * A record is mutable while an operation is in flight: it moves from
+   * `pending` to `completed` or `failed`. Coordination reads — waiting on
+   * another worker, verifying lease ownership before committing — must observe
+   * that transition, so a store that layers a cache in front of a shared
+   * backend has to bypass the cache here. Stores without a cache tier can omit
+   * this; `get` is used instead.
+   */
+  getConsistent?(key: string): Promise<IdempotencyStoreValue | null>;
   update(key: string, value: string, ttlSeconds: number | null): Promise<void>;
   delete(key: string): Promise<boolean>;
 }
@@ -160,7 +171,6 @@ export interface MySqlClientLike {
 
 export interface MongoCollectionLike<TDocument> {
   findOne(filter: Record<string, unknown>): Promise<TDocument | null>;
-  insertOne(doc: TDocument): Promise<{ acknowledged: boolean }>;
   updateOne(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
@@ -172,7 +182,8 @@ export interface MongoCollectionLike<TDocument> {
     upsertedId?: unknown;
   }>;
   deleteOne(filter: Record<string, unknown>): Promise<{ deletedCount?: number }>;
-  createIndex(keys: Record<string, unknown>, options?: Record<string, unknown>): Promise<string>;
+  /** Only needed when the store manages its own TTL index (`ensureIndexes` is not `false`). */
+  createIndex?(keys: Record<string, unknown>, options?: Record<string, unknown>): Promise<string>;
 }
 
 export interface SqliteRunResult {

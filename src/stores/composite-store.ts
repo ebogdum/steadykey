@@ -63,6 +63,24 @@ export class CompositeIdempotencyStore implements IdempotencyStore {
     return fromSource;
   }
 
+  /**
+   * Reads straight from the source, refreshing the cache with what it finds.
+   *
+   * The cache is per-process, so an entry written by this node goes stale the
+   * moment another node mutates the record. Serving a cached `pending` record
+   * to a caller waiting for that record to settle would make it wait out its
+   * whole timeout after the work had already finished.
+   */
+  async getConsistent(key: string): Promise<IdempotencyStoreValue | null> {
+    const fromSource = await this.source.get(key);
+    if (fromSource) {
+      await this.cachePut(key, fromSource.value, this.cacheTtl(fromSource.ttlSeconds ?? null));
+    } else {
+      await this.cache.delete(key).catch(() => undefined);
+    }
+    return fromSource;
+  }
+
   async update(key: string, value: string, ttlSeconds: number | null): Promise<void> {
     await this.source.update(key, value, ttlSeconds);
     await this.cachePut(key, value, this.cacheTtl(ttlSeconds));

@@ -7,6 +7,9 @@ type FetchLike = (input: string, init: {
   body: string;
 }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
+/** Redis replies -1 for "no expiry" and -2 for "no such key". */
+const KEY_MISSING = -2;
+
 export interface UpstashRedisStoreOptions {
   readonly url: string;
   readonly token: string;
@@ -65,6 +68,11 @@ export class UpstashRedisIdempotencyStore implements IdempotencyStore {
       return null;
     }
     const ttl = await this.command<number>(["TTL", key]);
+    if (ttl === KEY_MISSING) {
+      // The key expired between the GET and the TTL; report it as gone rather
+      // than as a record that never expires.
+      return null;
+    }
     return { value, ttlSeconds: ttl < 0 ? null : ttl };
   }
 

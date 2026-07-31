@@ -129,7 +129,12 @@ export const serializeRecord = ({ record }: SerializeRecordInput): string => {
 export const deserializeRecord = (value: string): IdempotencyRecord => {
   try {
     const parsed = JSON.parse(value) as IdempotencyRecord;
-    if (typeof parsed !== "object" || parsed === null || typeof parsed.id !== "string") {
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      typeof parsed.id !== "string" ||
+      typeof parsed.payloadHash !== "string"
+    ) {
       throw new IdempotencyError("Stored idempotency record has invalid shape");
     }
     return parsed;

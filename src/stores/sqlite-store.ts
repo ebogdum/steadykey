@@ -73,7 +73,7 @@ export class SqliteIdempotencyStore implements IdempotencyStore {
       this.db.get<SqliteRow>(
         `SELECT value, expires_at FROM ${this.table}
          WHERE key = ?
-           AND (expires_at IS NULL OR expires_at > STRFTIME('%s', 'now'))
+           AND (expires_at IS NULL OR expires_at > CAST(STRFTIME('%s', 'now') AS INTEGER))
          LIMIT 1`,
         [key],
       ),

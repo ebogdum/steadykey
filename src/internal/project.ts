@@ -7,10 +7,18 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   !(value instanceof Set) &&
   !Buffer.isBuffer(value);
 
+const hasOwn = (obj: Record<string, unknown>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(obj, key);
+
+/**
+ * Own properties only. Using `in` would report inherited members such as
+ * `toString` or `valueOf` as present, so projecting them would pull a function
+ * off the prototype chain into the payload being canonicalized.
+ */
 const hasPath = (obj: unknown, segments: readonly string[]): boolean => {
   let cursor: unknown = obj;
   for (const segment of segments) {
-    if (!isRecord(cursor) || !(segment in cursor)) {
+    if (!isRecord(cursor) || !hasOwn(cursor, segment)) {
       return false;
     }
     cursor = cursor[segment];
@@ -43,7 +51,7 @@ const setPath = (target: Record<string, unknown>, segments: readonly string[], v
 };
 
 const omitPath = (obj: unknown, segments: readonly string[]): unknown => {
-  if (!isRecord(obj) || !(segments[0] in obj)) {
+  if (!isRecord(obj) || !hasOwn(obj, segments[0])) {
     return obj;
   }
   const clone: Record<string, unknown> = { ...obj };

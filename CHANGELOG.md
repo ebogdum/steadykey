@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.1.0
+
+Correctness and robustness pass over the whole codebase, found by an adversarial review. No breaking changes.
+
+### Fixed
+
+- **`CompositeIdempotencyStore` could strand a caller waiting on another node.** The per-process cache served a stale `pending` copy of a record that the shared source had already moved to `completed`, so the waiter timed out with `IdempotencyInProgressError` after the work had finished. Coordination reads now bypass the cache tier through the new optional `IdempotencyStore.getConsistent`, and the read repairs the cache with what it finds.
+- **`InMemoryIdempotencyStore` never reclaimed expired entries.** Eviction was lazy and per-key, so a process that wrote many short-lived keys and never read them back grew without bound. Entries are now swept on an amortized schedule — by write volume, and by elapsed time so a traffic spike is released once it goes quiet. A store holding only persistent entries is never scanned.
+- **`execute()` could loop without honouring `waitTimeoutMs`.** The retry-after-failure and record-vanished paths looped straight back to the claim attempt with no deadline check and no delay, spinning against the store under contention. Every path that retries is now bounded by the deadline.
+- **Waiters hammered the store.** A caller blocked on another worker read once per `pollIntervalMs` for the whole timeout — 100 reads per waiter at the defaults, multiplied by every duplicate request. Polling now backs off exponentially toward one second. `pollIntervalMs` is the starting interval.
+- **Binary responses were cached corrupted.** Both middlewares stored the body as a UTF-8 string, which mangles bytes that are not valid UTF-8, and the Fastify plugin turned a non-string payload into `"[object Object]"` via `String()`. Such responses are now streamed through and left uncached.
+- **A body written with an explicit encoding was captured wrongly.** `res.write(chunk, "base64")` was read back as UTF-8. The encoding argument is now honoured, a write callback in that position is no longer mistaken for one, and a capture failure can never break the response it is observing.
+- **A malformed stored record crashed with `TypeError`.** A record missing `payloadHash` reached a constant-time comparison that rejects non-strings. `deserializeRecord` now validates the field, so it surfaces as `IdempotencyError` like every other bad-shape case.
+- **`pickFields` / `ignoreFields` matched inherited properties.** Paths were tested with `in`, so `pickFields: ["toString"]` resolved a function off the prototype chain and broke canonicalization. Own properties only.
+- **Redis and Upstash reported an expired key as persistent.** A key that vanished between the `GET` and the `TTL` returned its value with `ttlSeconds: null` ("never expires") instead of being reported absent.
+- **Schema-qualified tables could silently lose their index.** `schema.entries` and `schema_entries` flattened to the same index name, and because `CREATE INDEX IF NOT EXISTS` is a no-op when the name is taken, the second table ended up with no index on `expires_at`. Plain table names are unchanged; qualified ones get a digest suffix.
+- `MongoCollectionLike` no longer requires `insertOne`, which steadykey never calls, and `createIndex` is optional — needed only when the store manages its own TTL index.
+
+### Added
+
+- `IdempotencyStore.getConsistent?()` — optional; implement it only in a store that fronts a shared backend with a cache.
+- `InMemoryIdempotencyStore#purgeExpired()` and `#size` — force a sweep and report how many entries are held.
+
 ## 3.0.0
 
 Security release. Every issue below is reachable when the idempotency key comes from an untrusted source — which is the normal case for the HTTP middleware, where it is read straight from the `Idempotency-Key` request header.
