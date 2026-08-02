@@ -286,6 +286,14 @@ steadykey 2.0 hardens the canonical form (type-tagged values, `__proto__`-safe o
 
 Also new in 2.0: `execute()` and the pending/completed/failed lifecycle, HTTP middleware (`steadykey/middleware`), namespaces, field filtering, explicit client keys, batch operations, event hooks, sliding TTL, and the Upstash, Cloudflare D1, and Composite stores. The deprecated `buildRedisKey()` alias was removed (use `buildKey()`). `IdempotencyManager` methods now accept an options object with a `namespace`; existing calls remain source-compatible.
 
+## Performance
+
+`npm run bench` measures the hot paths against the built package. On Node 25 a realistic e-commerce payload (5 objects, 22 keys, 14 strings) derives a key in ~3.8 µs, a small payload in ~0.65 µs, and `buildKey` runs at ~12M ops/sec.
+
+Nearly all of that time is canonicalization and hashing, in that order. If key derivation ever shows up in your profile, the effective lever is payload size: `pickFields` narrows what gets canonicalized at all, and passing an explicit `idempotencyKey` skips derivation entirely.
+
+A note on benchmarking this yourself: measure each implementation **in a separate process**. JIT state and inline-cache shape leak between variants timed in the same one, which is enough to invert the result — an earlier draft of this work reported a change as both faster and slower depending on the group it was measured in.
+
 ## Development
 
 ```sh

@@ -12,6 +12,13 @@ const UNSAFE_CHAR = /[^\x21-\x7E]/u;
  */
 const UNSAFE_SEGMENT_CHAR = /[^\x21-\x7E]|[%:]/gu;
 
+/**
+ * Non-global twin of the above, used only to answer "is anything escaped here?".
+ * A separate object is required: `lastIndex` on a global regex persists between
+ * `test` calls, so reusing one would skip matches.
+ */
+const HAS_UNSAFE_SEGMENT_CHAR = /[^\x21-\x7E]|[%:]/u;
+
 const percentEncode = (char: string): string => {
   let encoded = "";
   for (const byte of Buffer.from(char, "utf8")) {
@@ -29,7 +36,10 @@ const percentEncode = (char: string): string => {
  * injective: two distinct segments can never encode to the same string, and two
  * distinct (namespace, id) pairs can never compose to the same key.
  */
-export const encodeKeySegment = (segment: string): string => segment.replace(UNSAFE_SEGMENT_CHAR, percentEncode);
+export const encodeKeySegment = (segment: string): string =>
+  // Hex digests and UUIDs — the overwhelming majority of ids — need no
+  // escaping, and returning them untouched avoids building a new string.
+  HAS_UNSAFE_SEGMENT_CHAR.test(segment) ? segment.replace(UNSAFE_SEGMENT_CHAR, percentEncode) : segment;
 
 export const assertKeyLength = (label: string, segment: string, maxLength: number): void => {
   if (segment.length > maxLength) {

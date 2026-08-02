@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.1.1
+
+Performance. **Generated keys are unchanged** — the canonical form is byte-identical to 3.1.0, verified by differentially fuzzing the old and new builds over 296,654 generated payloads (including class instances, typed arrays, null-prototype objects, `Map`/`Set`, lone surrogates, and array-index keys): zero divergence in either the canonical string or the final hash.
+
+Measured on Node 25, median of 15 samples, each variant in its own process:
+
+| Operation | Before | After | |
+|---|---|---|---|
+| `steadyKey` (small payload) | 1048 ns | 692 ns | **1.52x** |
+| `steadyKey` (realistic payload) | 5004 ns | 3793 ns | **1.32x** |
+| `steadyKey` (200-row payload) | 147.5 µs | 111.4 µs | **1.32x** |
+| `steadyKey` (sha512) | 5361 ns | 3571 ns | **1.50x** |
+| `canonicalize` | 3977 ns | 2823 ns | **1.41x** |
+| `buildKey` | 107 ns | 78 ns | **1.38x** |
+
+### Changed
+
+- **`canonicalize` emits its JSON in a single pass** instead of building a parallel normalized object graph and then stringifying it.
+- **Strings are quoted without a `JSON.stringify` call** when they contain nothing needing an escape, which is nearly always. The scan runs on the raw value rather than on `prefix + value`, since concatenating first forces V8 to flatten the rope before the scan can start — that detail alone was worth 2.2x on the per-string cost.
+- **Type dispatch is ordered by real-world frequency**, and a plain object is recognised from its constructor so `instanceof Date` / `Buffer.isBuffer` / `instanceof Map` / `instanceof Set` are skipped entirely for the common case. `Buffer.isBuffer` alone measured 2.7x the cost of the other probes and ran on every value.
+- **Key sorting uses the default `Array#sort`**, whose ordering is already UTF-16 code units, avoiding a comparator callback per comparison.
+- **Hashing uses the one-shot `crypto.hash`** on Node 20.12+ / 21.7+, which is ~2x faster than allocating and driving a streaming `Hash`. Node 18 and 19 fall back to `createHash`.
+- **`buildKey` skips the escape pass** when a segment contains nothing to escape.
+
+### Added
+
+- `npm run bench` — reproducible benchmarks for the hot paths, in `bench/`.
+
 ## 3.1.0
 
 Correctness and robustness pass over the whole codebase, found by an adversarial review. No breaking changes.
